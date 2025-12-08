@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>毛象乱选</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* Custom scrollbar for better aesthetics */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #cbd5e1;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #94a3b8;
+      }
+      
+      /* Animation classes */
+      @keyframes fade-in {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+      
+      @keyframes fade-in-up {
+        from { 
+          opacity: 0;
+          transform: translateY(20px);
+        }
+        to { 
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      
+      .animate-fade-in {
+        animation: fade-in 0.3s ease-in-out;
+      }
+      
+      .animate-fade-in-up {
+        animation: fade-in-up 0.5s ease-out;
+      }
+      
+      .animate-pulse {
+        animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      }
+      
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: .5; }
+      }
+      
+      .animate-spin {
+        animation: spin 1s linear infinite;
+      }
+      
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+      
+      /* Prose styles for content */
+      .prose {
+        max-width: none;
+      }
+      
+      .prose p {
+        margin-top: 0.5rem;
+        margin-bottom: 0.5rem;
+      }
+      
+      .prose a {
+        color: #4f46e5;
+        text-decoration: none;
+      }
+      
+      .prose a:hover {
+        text-decoration: underline;
+      }
+      
+      /* Custom emoji styles */
+      .custom-emoji {
+        height: 1.25rem;
+        width: 1.25rem;
+        vertical-align: text-bottom;
+        margin: 0 0.1em;
+        display: inline-block;
+      }
+    </style>
+  </head>
+  <body class="bg-slate-50 text-slate-900 font-sans antialiased selection:bg-indigo-100 selection:text-indigo-700">
+    <div id="app"></div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
