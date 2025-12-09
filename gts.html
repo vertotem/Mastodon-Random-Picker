@@ -65,14 +65,20 @@
             <h2 style="color: #28a745;">步骤 2: 获取授权码 (Code)</h2>
             
             <p style="font-weight: bold;">2A. 授权：</p>
-            <p>请复制下面的链接到浏览器中打开，执行授权操作：</p>
-            <textarea id="auth_url_output" style="width: 90%; height: 80px; padding: 5px; border: 1px dashed #008000; margin-bottom: 10px;" readonly></textarea>
+            <p>生成链接后点击下方文本在新标签中打开授权页面；如果未生成，请先完成步骤 1。</p>
+            <a 
+              id="auth_link_output" 
+              href="#" 
+              target="_blank" 
+              style="color: #dc3545; font-weight: bold; margin-left: 10px; text-decoration: none;"
+              onclick="handleAuthLinkClick(event)"
+            >[点击此处打开授权页面]</a>
             
             <p style="font-weight: bold;">操作指导：</p>
             <p>完成授权后，新页面将显示一行文字：<b><code>Here's your out-of-band token...</code></b>，后面的长字符串就是您的 <b>授权码 (Code)</b>。</p>
 
             <p style="font-weight: bold;">2B. 复制授权码：</p>
-            <label for="auth_code">粘贴您复制的授权码 (Code):</label><br>
+            <label for="auth_code">在新标签完成授权后，会显示一行“Here’s your out-of-band token...”的长字符串，请粘贴到这里：</label><br>
             <input type="text" id="auth_code" class="input-text" required><br>
 
             <button onclick="updateStepHighlight(3)" class="button-style btn-success">完成步骤 2，最终交换 Token</button>
@@ -91,6 +97,13 @@
             <p style="margin-top: 15px; font-weight: bold;">3B. 结果：</p>
             <div id="result_output" style="border: 1px solid #ccc; padding: 15px; margin-top: 10px; background-color: #fff8e1; min-height: 50px; word-wrap: break-word;">
                 Access Token 将显示在这里...
+            </div>
+            <div style="margin-top: 8px;">
+                <a 
+                    href="#" 
+                    onclick="copyResult(event)" 
+                    style="color: #dc3545; font-weight: bold; margin-left: 10px; text-decoration: none;"
+                >[点击复制到剪贴板]</a>
             </div>
         </section>
 
@@ -124,10 +137,13 @@
 
         // --- Step 1: 实例 URL 处理 ---
         function updateRegistrationLink(event) {
-            const instanceUrl = document.getElementById('instance_url').value.trim().replace(/\/$/, '');
-            if (!instanceUrl) {
+            const rawInput = document.getElementById('instance_url').value.trim();
+            const instanceUrl = rawInput.replace(/\/+$/, ''); // 去掉末尾多余斜杠
+            const isPlaceholder = rawInput === '' || /^https?:\/\/\s*$/i.test(rawInput) || instanceUrl === 'https:' || instanceUrl === 'http:';
+            const hasProtocolAndHost = /^https?:\/\/[^\/]+/i.test(instanceUrl);
+            if (isPlaceholder || !hasProtocolAndHost) {
                 event.preventDefault();
-                alert('请先输入实例 URL！');
+                alert('请先输入完整的实例 URL（例如：https://example.com）！');
                 return;
             }
             
@@ -147,19 +163,26 @@
         function updateStepHighlight(nextStep) {
             // 验证和数据收集
             if (nextStep === 2) {
-                const instanceUrl = document.getElementById('instance_url').value.trim().replace(/\/$/, '');
+                const rawInstanceUrl = document.getElementById('instance_url').value.trim();
+                const instanceUrl = rawInstanceUrl.replace(/\/+$/, '');
                 const clientId = document.getElementById('client_id').value.trim();
                 const clientSecret = document.getElementById('client_secret').value.trim();
+                const isPlaceholder = rawInstanceUrl === '' || /^https?:\/\/\s*$/i.test(rawInstanceUrl) || instanceUrl === 'https:' || instanceUrl === 'http:';
+                const hasProtocolAndHost = /^https?:\/\/[^\/]+/i.test(instanceUrl);
 
-                if (!instanceUrl || !clientId || !clientSecret) {
-                    alert('错误：请确保所有凭证都已填写。');
+                if (!instanceUrl || isPlaceholder || !hasProtocolAndHost || !clientId || !clientSecret) {
+                    alert('错误：请确保实例 URL、Client ID、Client Secret 都已填写，并且实例 URL 为完整格式（如：https://example.com）。');
                     return;
                 }
                 
                 // 存储并生成授权 URL
                 globalConfig = { ...globalConfig, instanceUrl, clientId, clientSecret };
                 const authUrl = `${instanceUrl}/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=${globalConfig.redirectUri}&scope=${globalConfig.scopes}`;
-                document.getElementById('auth_url_output').value = authUrl;
+                const authLink = document.getElementById('auth_link_output');
+                if (authLink) {
+                    authLink.href = authUrl;
+                    authLink.dataset.enabled = "true";
+                }
 
             } else if (nextStep === 3) {
                 const authCode = document.getElementById('auth_code').value.trim();
@@ -174,6 +197,57 @@
             highlightStep(nextStep);
             const nextElement = getStepElement(nextStep);
             if (nextElement) nextElement.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function handleAuthLinkClick(event) {
+            const link = document.getElementById('auth_link_output');
+            if (!link || link.dataset.enabled !== "true") {
+                event.preventDefault();
+                alert('请先完成步骤 1，生成授权链接后再点击。');
+                return false;
+            }
+            // allow default behavior when enabled
+            return true;
+        }
+
+        function copyResult(event) {
+            event.preventDefault();
+            const resultEl = document.getElementById('result_output');
+            if (!resultEl) {
+                alert('未找到可复制的内容。');
+                return;
+            }
+            // 优先从结果区域的 textarea 读取 Token
+            const tokenTextarea = resultEl.querySelector('textarea');
+            const text = tokenTextarea ? tokenTextarea.value.trim() : resultEl.innerText.trim();
+            if (!text || text.includes('Access Token 将显示在这里')) {
+                alert('还没有可复制的 Token。请先完成获取。');
+                return;
+            }
+            if (text === '请先完成步骤 1。') {
+                alert('请先完成步骤 1/2 并生成 Token 后再复制。');
+                return;
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(() => {
+                    alert('已复制到剪贴板！');
+                }).catch(() => {
+                    alert('复制失败，请手动选择内容复制。');
+                });
+            } else {
+                // 旧浏览器降级
+                const temp = document.createElement('textarea');
+                temp.value = text;
+                document.body.appendChild(temp);
+                temp.select();
+                try {
+                    document.execCommand('copy');
+                    alert('已复制到剪贴板！');
+                } catch (e) {
+                    alert('复制失败，请手动选择内容复制。');
+                }
+                document.body.removeChild(temp);
+            }
         }
 
 
