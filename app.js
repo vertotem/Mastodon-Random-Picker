@@ -62,11 +62,19 @@ let state = {
   showFilters: false, // 是否展开筛选面板
   // 暂停控制
   isPaused: false,
+  // 实例 Token 缓存（按域名存储），用于需要认证的实例
+  authTokens: {},
+  tokenRequest: {
+    visible: false,
+    domain: null,
+  },
 };
 
 // 使用Ref在循环中即时读取（纯JS中用变量代替）
 let pausedRef = false;
 let stopRef = false;
+let tokenRequestResolver = null;
+let tokenRequestRejecter = null;
 
 // Helper to load history
 const loadHistory = (accountId) => {
@@ -84,6 +92,49 @@ const saveHistory = (accountId, ids) => {
   const storageKey = `seen_statuses_${accountId}`;
   localStorage.setItem(storageKey, JSON.stringify(Array.from(ids)));
 };
+
+// Load/save access tokens (per domain)
+const loadAuthTokens = () => {
+  try {
+    const raw = localStorage.getItem('instance_tokens');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        state.authTokens = parsed;
+      }
+    }
+  } catch {
+    state.authTokens = {};
+  }
+};
+
+const saveAuthToken = (domain, token) => {
+  if (!domain || !token) return;
+  state.authTokens[domain] = token;
+  try {
+    localStorage.setItem('instance_tokens', JSON.stringify(state.authTokens));
+  } catch {
+    // ignore quota errors
+  }
+};
+
+const getAuthToken = (domain) => {
+  if (!domain) return null;
+  return state.authTokens[domain] || null;
+};
+
+// Prompt user for token when API requires authentication
+const promptForToken = async (domain) => {
+  return new Promise((resolve, reject) => {
+    state.tokenRequest = { visible: true, domain };
+    tokenRequestResolver = resolve;
+    tokenRequestRejecter = reject;
+    render();
+  });
+};
+
+// 初始化读取本地存储的 Token
+loadAuthTokens();
 
 // Extract domain from account URL
 const extractDomainFromAccount = (account) => {
@@ -427,8 +478,20 @@ const executeFetch = async (type) => {
       if (mastoParsed) {
         try {
           domain = mastoParsed.domain;
+          let mastoHeaders = {};
+          const cachedToken = getAuthToken(domain);
+          if (cachedToken) {
+            mastoHeaders.Authorization = `Bearer ${cachedToken}`;
+          }
+
           const lookupUrl = `https://${mastoParsed.domain}/api/v1/accounts/lookup?acct=${mastoParsed.username}`;
-          const lookupRes = await fetch(lookupUrl);
+          let lookupRes = await fetch(lookupUrl, { headers: mastoHeaders });
+          // 如果需要认证，则提示用户输入 Token 后重试
+          if (lookupRes.status === 401 || lookupRes.status === 403) {
+            const token = await promptForToken(domain);
+            mastoHeaders.Authorization = `Bearer ${token}`;
+            lookupRes = await fetch(lookupUrl, { headers: mastoHeaders });
+          }
           if (!lookupRes.ok) throw new Error('无法找到该用户。');
           accountData = await lookupRes.json();
           if (!accountData) throw new Error('账户数据解析失败');
@@ -699,8 +762,22 @@ const executeFetch = async (type) => {
         if (nextMaxId) statusesUrl += `&max_id=${nextMaxId}`;
         if (sinceId) statusesUrl += `&since_id=${sinceId}`; // 注意: Mastodon API 对于 since_id 有时只返回新数据，不一定分页
 
+        // 准备 Header，若已有 Token 直接带上
+        let mastoHeaders = {};
+        const cachedToken = getAuthToken(domain);
+        if (cachedToken) {
+          mastoHeaders.Authorization = `Bearer ${cachedToken}`;
+        }
+
         // 发起请求
-        const res = await fetch(statusesUrl);
+        let res = await fetch(statusesUrl, { headers: mastoHeaders });
+        // 未认证则提示用户输入 Token 后重试
+        if (res.status === 401 || res.status === 403) {
+          const token = await promptForToken(domain);
+          mastoHeaders.Authorization = `Bearer ${token}`;
+          res = await fetch(statusesUrl, { headers: mastoHeaders });
+        }
+
         if (!res.ok) throw new Error('API 请求失败: ' + res.statusText);
         
         const batch = await res.json();
@@ -1641,6 +1718,54 @@ const render = () => {
         </p>
       </header>
 
+      <!-- Token Prompt -->
+      ${state.tokenRequest.visible ? `
+        <div class="w-full max-w-xl mb-6 animate-fade-in">
+          <div class="p-5 rounded-2xl border border-amber-200 bg-amber-50 shadow-sm">
+            <div class="flex items-start gap-3 text-amber-800">
+              ${icons.AlertCircle(18)}
+              <div class="flex-1">
+                <p class="font-semibold mb-1">该实例需要 Access Token 才能继续抓取</p>
+                <p class="text-sm text-amber-700 leading-relaxed">
+                  实例：<span class="font-mono">${state.tokenRequest.domain || ''}</span><br/>
+                  如果是 GoToSocial，请先打开下方指引页面申请长期 Token，并粘贴到输入框。已有 Token 可直接粘贴；Token 仅保存在本地浏览器，请妥善保存。
+                </p>
+                <div class="mt-3 flex flex-col gap-2">
+                  <a 
+                    id="token-open-guide"
+                    class="inline-flex items-center justify-center gap-1 px-3 py-2 rounded-md bg-white text-amber-800 border border-amber-200 hover:bg-amber-100 text-sm transition-colors"
+                    href="gts.html"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    ${icons.ExternalLink(14)} 新标签打开 GoToSocial 指引
+                  </a>
+                  <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <input
+                      id="token-input"
+                      type="text"
+                      class="flex-1 px-3 py-2 rounded-md border border-amber-200 focus:border-amber-400 focus:ring-2 focus:ring-amber-100 outline-none bg-white"
+                      placeholder="在此粘贴 Access Token（本地存储，仅用于该实例）"
+                      value="${getAuthToken(state.tokenRequest.domain) || ''}"
+                    />
+                    <div class="flex gap-2 sm:justify-end">
+                      <button 
+                        id="token-submit"
+                        class="px-4 py-2 rounded-md bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 transition-colors"
+                      >保存并继续</button>
+                      <button 
+                        id="token-cancel"
+                        class="px-3 py-2 rounded-md border border-amber-200 text-amber-700 text-sm bg-white hover:bg-amber-100 transition-colors"
+                      >取消</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ` : ''}
+
       <!-- Input Section (Hidden when data is loaded) -->
       ${!state.currentAccount ? `
         <div class="w-full max-w-xl mb-8 animate-fade-in">
@@ -1650,7 +1775,7 @@ const render = () => {
                 type="url"
                 id="url-input"
                 class="w-full py-4 pl-6 pr-14 outline-none text-slate-700 placeholder:text-slate-400"
-                placeholder="输入主页链接 (支持 Mastodon / Misskey)"
+                placeholder="输入主页链接 (支持 Mastodon / Misskey / GoToSocial )"
                 value="${state.urlInput}"
                 required
                 ${state.loading ? 'disabled' : ''}
@@ -2179,6 +2304,57 @@ const attachEventListeners = () => {
   const urlForm = document.getElementById('url-form');
   if (urlForm) {
     urlForm.addEventListener('submit', handleFetch);
+  }
+
+  // Token prompt controls
+  const tokenSubmit = document.getElementById('token-submit');
+  const tokenCancel = document.getElementById('token-cancel');
+  const tokenInput = document.getElementById('token-input');
+  const tokenOpenGuide = document.getElementById('token-open-guide');
+
+  if (tokenOpenGuide) {
+    tokenOpenGuide.addEventListener('click', (e) => {
+      // Just ensure new tab; default behavior is fine.
+      e.stopPropagation();
+    });
+  }
+
+  if (tokenInput) {
+    tokenInput.addEventListener('input', () => {
+      tokenInput.classList.remove('border-red-400', 'focus:ring-red-100');
+    });
+  }
+
+  if (tokenSubmit) {
+    tokenSubmit.addEventListener('click', () => {
+      if (!state.tokenRequest.domain) return;
+      const value = tokenInput ? tokenInput.value.trim() : '';
+      if (!value) {
+        if (tokenInput) {
+          tokenInput.classList.add('border-red-400', 'focus:ring-red-100');
+          tokenInput.focus();
+        }
+        return;
+      }
+      saveAuthToken(state.tokenRequest.domain, value);
+      state.tokenRequest = { visible: false, domain: null };
+      const resolver = tokenRequestResolver;
+      tokenRequestResolver = null;
+      tokenRequestRejecter = null;
+      render();
+      if (resolver) resolver(value);
+    });
+  }
+
+  if (tokenCancel) {
+    tokenCancel.addEventListener('click', () => {
+      state.tokenRequest = { visible: false, domain: null };
+      const rejecter = tokenRequestRejecter;
+      tokenRequestResolver = null;
+      tokenRequestRejecter = null;
+      render();
+      if (rejecter) rejecter(new Error('需要 Access Token'));
+    });
   }
 
   // URL input

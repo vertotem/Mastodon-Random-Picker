@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>GoToSocial Access Token 获取工具</title>
+    <style>
+        /* 仅使用内联样式，但为了方便阅读，将通用样式放在这里 */
+        body { font-family: sans-serif; line-height: 1.6; }
+        h1, h2 { margin-top: 0; }
+        section { padding: 15px; margin-bottom: 20px; border-radius: 4px; }
+        .input-text { width: 80%; padding: 8px; margin-bottom: 10px; }
+        .button-style { padding: 10px 20px; color: white; border: none; cursor: pointer; border-radius: 4px; }
+        .btn-primary { background-color: #007bff; }
+        .btn-success { background-color: #28a745; }
+        .btn-danger { background-color: #dc3545; }
+        .highlighted { border: 2px solid #4CAF50 !important; background-color: #e8f5e9 !important; }
+        .normal { border: 1px solid #ccc !important; background-color: white !important; }
+    </style>
+</head>
+<body>
+
+    <h1 style="color: #0056b3;">🔑 GoToSocial Access Token 获取工具</h1>
+    <hr>
+
+    <div id="main_container">
+        
+        <section id="step1_register" class="highlighted">
+            <h2 style="color: #007bff;">步骤 1: 注册应用并获取 ID/Secret</h2>
+            
+            <p style="font-weight: bold;">1A. 前往注册页面：</p>
+            
+            <label for="instance_url">实例 URL:</label>
+            <input type="url" id="instance_url" value="https://" class="input-text" required>
+            
+            <br/><a id="register_link" href="#" target="_blank" style="color: #dc3545; font-weight: bold; margin-left: 10px;" onclick="updateRegistrationLink(event)">[填写完成后点击此处打开应用注册页面]</a>
+            
+            <p style="margin-top: 15px; font-weight: bold;">操作指导：</p>
+            <ol>
+                <li>请点击上方的链接，在新页面中登录您的 GoToSocial 账户。</li>
+                <li>在新页面的注册表单中：
+                    <ul>
+                        <li><b>Application name (应用名称):</b> <b>必须</b> 填写一个名字（例如：`MyTokenTool`）。</li>
+                        <li><b>Redirect URIs (重定向 URI):</b>无需填写，留空即可</li>
+                        <li><b>Scopes (权限范围):</b>无需填写，留空即可</li>
+                    </ul>
+                </li>
+                <li>点击 <b>“创建 (Create)”</b>，然后将页面显示的 <b>Client ID</b> 和 <b>Client Secret</b> 复制到下方。</li>
+            </ol>
+            
+            <p style="font-weight: bold;">1B. 复制返回的凭证到下方：</p>
+
+            <label for="client_id">Client ID:</label>
+            <input type="text" id="client_id" class="input-text" required><br>
+
+            <label for="client_secret">Client Secret:</label>
+            <input type="text" id="client_secret" class="input-text" required><br>
+
+            <button onclick="updateStepHighlight(2)" class="button-style btn-primary">完成步骤 1，进入步骤 2</button>
+        </section>
+
+        <hr>
+
+        <section id="step2_authcode" class="normal">
+            <h2 style="color: #28a745;">步骤 2: 获取授权码 (Code)</h2>
+            
+            <p style="font-weight: bold;">2A. 授权：</p>
+            <p>请复制下面的链接到浏览器中打开，执行授权操作：</p>
+            <textarea id="auth_url_output" style="width: 90%; height: 80px; padding: 5px; border: 1px dashed #008000; margin-bottom: 10px;" readonly></textarea>
+            
+            <p style="font-weight: bold;">操作指导：</p>
+            <p>完成授权后，新页面将显示一行文字：<b><code>Here's your out-of-band token...</code></b>，后面的长字符串就是您的 <b>授权码 (Code)</b>。</p>
+
+            <p style="font-weight: bold;">2B. 复制授权码：</p>
+            <label for="auth_code">粘贴您复制的授权码 (Code):</label><br>
+            <input type="text" id="auth_code" class="input-text" required><br>
+
+            <button onclick="updateStepHighlight(3)" class="button-style btn-success">完成步骤 2，最终交换 Token</button>
+        </section>
+        
+        <hr>
+
+        <section id="step3_exchange" class="normal">
+            <h2 style="color: #dc3545;">步骤 3: 交换 Access Token</h2>
+            
+            <p style="font-weight: bold;">3A. 运行交换：</p>
+            <p>点击按钮后，脚本将使用您提供的 ID/Secret 和 Code，在浏览器中完成最终的 Token 交换。</p>
+            
+            <button onclick="getAccessToken()" class="button-style btn-danger">点击运行：获取 Access Token</button>
+
+            <p style="margin-top: 15px; font-weight: bold;">3B. 结果：</p>
+            <div id="result_output" style="border: 1px solid #ccc; padding: 15px; margin-top: 10px; background-color: #fff8e1; min-height: 50px; word-wrap: break-word;">
+                Access Token 将显示在这里...
+            </div>
+        </section>
+
+    </div>
+
+    <script>
+        let globalConfig = { redirectUri: "urn:ietf:wg:oauth:2.0:oob", scopes: "read" };
+
+        // --- UI 和高亮控制 ---
+        function getStepElement(step) {
+            if (step === 1) return document.getElementById('step1_register');
+            if (step === 2) return document.getElementById('step2_authcode');
+            if (step === 3) return document.getElementById('step3_exchange');
+            return null;
+        }
+
+        function highlightStep(step) {
+            [1, 2, 3].forEach(s => {
+                const element = getStepElement(s);
+                if (element) {
+                    element.className = (s === step) ? 'highlighted' : 'normal';
+                }
+            });
+        }
+
+        // 页面初始化时，只高亮 Step 1
+        window.onload = function() {
+            highlightStep(1);
+            document.getElementById('result_output').innerHTML = '请先完成步骤 1。';
+        };
+
+        // --- Step 1: 实例 URL 处理 ---
+        function updateRegistrationLink(event) {
+            const instanceUrl = document.getElementById('instance_url').value.trim().replace(/\/$/, '');
+            if (!instanceUrl) {
+                event.preventDefault();
+                alert('请先输入实例 URL！');
+                return;
+            }
+            
+            // GoToSocial/Mastodon 的应用注册页面路径
+            const registerPageUrl = `${instanceUrl}/settings/user/applications/new`;
+            document.getElementById('register_link').href = registerPageUrl;
+
+            // 存储实例 URL
+            globalConfig.instanceUrl = instanceUrl;
+            
+            // 阻止默认跳转，手动在新窗口打开
+            event.preventDefault();
+            window.open(registerPageUrl, '_blank');
+        }
+
+        // --- 步骤控制函数 ---
+        function updateStepHighlight(nextStep) {
+            // 验证和数据收集
+            if (nextStep === 2) {
+                const instanceUrl = document.getElementById('instance_url').value.trim().replace(/\/$/, '');
+                const clientId = document.getElementById('client_id').value.trim();
+                const clientSecret = document.getElementById('client_secret').value.trim();
+
+                if (!instanceUrl || !clientId || !clientSecret) {
+                    alert('错误：请确保所有凭证都已填写。');
+                    return;
+                }
+                
+                // 存储并生成授权 URL
+                globalConfig = { ...globalConfig, instanceUrl, clientId, clientSecret };
+                const authUrl = `${instanceUrl}/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=${globalConfig.redirectUri}&scope=${globalConfig.scopes}`;
+                document.getElementById('auth_url_output').value = authUrl;
+
+            } else if (nextStep === 3) {
+                const authCode = document.getElementById('auth_code').value.trim();
+                if (!authCode) {
+                    alert('错误：请先粘贴授权码 (Code)！');
+                    return;
+                }
+                globalConfig.authCode = authCode;
+            }
+
+            // 更新高亮和滚动
+            highlightStep(nextStep);
+            const nextElement = getStepElement(nextStep);
+            if (nextElement) nextElement.scrollIntoView({ behavior: 'smooth' });
+        }
+
+
+        // --- 最终步骤：获取 Access Token ---
+        function getAccessToken() {
+            const output = document.getElementById('result_output');
+            
+            // 最终检查
+            if (!globalConfig.authCode || !globalConfig.clientId) {
+                output.innerHTML = '<span style="color: red;">错误：请返回步骤 1 和 2 确保所有信息已输入。</span>';
+                highlightStep(1);
+                return;
+            }
+
+            output.innerHTML = '正在发送请求，在浏览器中交换 Access Token...';
+            highlightStep(3);
+            
+            // 构造 Token 交换请求的 Body
+            const tokenUrl = `${globalConfig.instanceUrl}/oauth/token`;
+            
+            const params = new URLSearchParams();
+            params.append('grant_type', 'authorization_code');
+            params.append('client_id', globalConfig.clientId);
+            params.append('client_secret', globalConfig.clientSecret);
+            params.append('redirect_uri', globalConfig.redirectUri);
+            params.append('code', globalConfig.authCode);
+            
+            // 使用 fetch API 发送 POST 请求
+            fetch(tokenUrl, {
+                method: 'POST',
+                // Content-Type: application/x-www-form-urlencoded
+                body: params
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(errorData => {
+                        throw new Error(`HTTP 错误 ${response.status}: ${JSON.stringify(errorData, null, 2)}`);
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                // 成功获取 Access Token
+                if (data.access_token) {
+                    output.innerHTML = `
+                        <p style="color: green; font-weight: bold; font-size: 1.2em;">🎉 Access Token 获取成功！</p>
+                        <p>请复制以下 Access Token：</p>
+                        <textarea style="width: 90%; height: 100px; padding: 5px; border: 2px solid #008000;" readonly>${data.access_token}</textarea>
+                        <p>Token 类型: ${data.token_type}</p>
+                    `;
+                } else {
+                    output.innerHTML = '<span style="color: orange;">获取失败：响应中缺少 Access Token。</span><br>' + JSON.stringify(data, null, 2);
+                }
+            })
+            .catch(error => {
+                console.error("Token 交换失败:", error);
+                output.innerHTML = `<span style="color: red; font-weight: bold;">发生错误：请检查您的凭证或 Code 是否正确。</span><pre style="white-space: pre-wrap; font-family: monospace;">${error.message}</pre>`;
+            });
+        }
+    </script>
+
+</body>
+</html>
