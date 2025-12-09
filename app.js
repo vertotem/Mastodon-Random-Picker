@@ -154,6 +154,10 @@ const stopFetch = () => {
     pausedRef = false;
     state.isPaused = false;
   }
+  // 停止后即使还在loading状态，如果有数据就允许查看
+  if (state.allStatuses.length > 0) {
+    state.loading = false;
+  }
   render();
 };
 
@@ -1123,6 +1127,10 @@ const updateFetchCount = () => {
   if (countElementIncremental) {
     countElementIncremental.textContent = state.fetchCount;
   }
+  const countElementInitial = document.getElementById('fetch-count-initial');
+  if (countElementInitial) {
+    countElementInitial.textContent = state.fetchCount;
+  }
 };
 
 // Main render function
@@ -1358,7 +1366,7 @@ const render = () => {
       ` : ''}
 
       <!-- Loading State (When fetching data initially) -->
-      ${state.currentAccount && state.loading && state.fetchType === 'initial' ? `
+      ${state.currentAccount && state.loading && state.fetchType === 'initial' && (!state.isPaused || state.allStatuses.length === 0) ? `
         <div class="w-full max-w-2xl flex flex-col items-center gap-8 animate-fade-in-up">
           <div class="w-full min-h-[200px] flex justify-center items-start">
             <div class="text-center text-slate-400 mt-4 w-full">
@@ -1370,18 +1378,34 @@ const render = () => {
                     class="w-20 h-20 rounded-full border-4 border-slate-50"
                   />
                   <div class="absolute -bottom-1 -right-1 bg-indigo-500 text-white p-1 rounded-full border-2 border-white">
-                    ${icons.Loader2(14)}
+                    ${state.isPaused ? icons.Pause(14) : icons.Loader2(14)}
                   </div>
                 </div>
                 <h2 class="text-xl font-bold text-slate-800">${replaceCustomEmojis(state.currentAccount.display_name || state.currentAccount.username)}</h2>
                 <p class="text-sm text-slate-500 mb-6">@${state.currentAccount.acct}</p>
                 
-                <div class="bg-indigo-50 px-6 py-4 rounded-lg text-sm text-indigo-700 mb-2 flex items-center gap-2">
-                  ${icons.Loader2(20)}
+                <div class="bg-indigo-50 px-6 py-4 rounded-lg text-sm text-indigo-700 mb-4 flex items-center gap-2">
+                  ${state.isPaused ? icons.Pause(20) : icons.Loader2(20)}
                   <div class="text-left">
-                    <p class="font-bold">正在抓取数据...</p>
-                    <p>已抓取 <span id="fetch-count" class="font-bold text-indigo-600">${state.fetchCount}</span> 条嘟文，请耐心等待</p>
+                    <p class="font-bold">${state.isPaused ? '已暂停抓取' : '正在抓取数据...'}</p>
+                    <p>已抓取 <span id="fetch-count-initial" class="font-bold text-indigo-600">${state.fetchCount}</span> 条嘟文${state.isPaused ? '，可以查看已抓取的数据' : '，请耐心等待'}</p>
                   </div>
+                </div>
+
+                <!-- 暂停/继续/停止按钮 -->
+                <div class="flex justify-center gap-3 w-full">
+                  <button 
+                    id="toggle-pause-initial"
+                    class="flex items-center gap-1.5 px-4 py-2 rounded-md bg-indigo-50 text-indigo-600 hover:bg-indigo-100 text-sm font-medium transition-colors"
+                  >
+                    ${state.isPaused ? `${icons.Play(14)} 继续抓取` : `${icons.Pause(14)} 暂停抓取`}
+                  </button>
+                  <button 
+                    id="stop-fetch-initial"
+                    class="flex items-center gap-1.5 px-4 py-2 rounded-md bg-red-50 text-red-600 hover:bg-red-100 text-sm font-medium transition-colors"
+                  >
+                    ${icons.Square(14)} 停止并查看
+                  </button>
                 </div>
               </div>
             </div>
@@ -1409,7 +1433,7 @@ const render = () => {
       ` : ''}
 
       <!-- Main Content Area (Data Loaded) -->
-      ${state.currentAccount && state.allStatuses.length > 0 && !state.loading ? `
+      ${state.currentAccount && state.allStatuses.length > 0 && (!state.loading || state.isPaused) ? `
         <div class="w-full max-w-2xl flex flex-col items-center gap-8 animate-fade-in-up">
           
           <!-- 1. Status Display -->
@@ -1856,6 +1880,17 @@ const attachEventListeners = () => {
   const stopFetchIncremental = document.getElementById('stop-fetch-incremental');
   if (stopFetchIncremental) {
     stopFetchIncremental.addEventListener('click', stopFetch);
+  }
+
+  // 初始抓取的暂停/停止按钮
+  const togglePauseInitial = document.getElementById('toggle-pause-initial');
+  if (togglePauseInitial) {
+    togglePauseInitial.addEventListener('click', togglePause);
+  }
+
+  const stopFetchInitial = document.getElementById('stop-fetch-initial');
+  if (stopFetchInitial) {
+    stopFetchInitial.addEventListener('click', stopFetch);
   }
 
   // 显示筛选面板
