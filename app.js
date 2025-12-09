@@ -1,4 +1,5 @@
 import { parseMastodonUrl, formatDate, downloadJson } from './utils.js';
+import { parseMisskeyUrl, getAllNotesData, getUserId, getInstanceEmojis } from './missky.js';
 import { icons } from './icons.js';
 
 // Global keyboard handler for fullscreen images
@@ -29,6 +30,8 @@ const setupKeyboardNavigation = () => {
 // State management
 let state = {
   mode: 'url',
+  platform: 'auto', // 兼容字段，已自动判定
+  platformLocked: null, // 记录首次抓取的平台，后续沿用
   urlInput: '',
   showTutorial: false,
   loading: false,
@@ -40,6 +43,7 @@ let state = {
   currentStatus: null,
   viewedIds: new Set(),
   customEmojis: [], // Store custom emojis for current instance
+  misskeyEmojis: {}, // Store Misskey custom emojis (object format)
   // 抓取配置 (Fetch Settings)
   fetchConfig: {
     excludeReplies: true,
@@ -101,6 +105,213 @@ const extractDomainFromAccount = (account) => {
   }
 };
 
+// Fetch a single batch of Misskey notes with optional sinceId/untilId
+const fetchMisskeyBatch = async ({
+  domain,
+  userId,
+  limit = 100,
+  includeReplies = true,
+  includeRenotes = true,
+  sinceId = null,
+  untilId = null,
+  token = null,
+  shouldStop = () => false,
+  shouldPause = () => false,
+}) => {
+  // 简单轮询暂停/停止
+  if (shouldStop()) return [];
+  while (shouldPause()) {
+    await new Promise((r) => setTimeout(r, 300));
+    if (shouldStop()) return [];
+  }
+
+  const body = {
+    userId,
+    limit,
+    includeReplies,
+    includeRenotes,
+  };
+  if (sinceId) body.sinceId = sinceId;
+  if (untilId) body.untilId = untilId;
+  if (token) body.i = token;
+
+  const apiUrl = `https://${domain}/api/users/notes`;
+  const res = await fetch(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error('Misskey API 请求失败: ' + res.statusText);
+  const notes = await res.json();
+  if (!Array.isArray(notes)) throw new Error('Misskey 返回格式不正确');
+  return notes;
+};
+
+// 判定是否应隐藏的帖子（例如需要登录才能查看或内容为空且无转发）
+const shouldHideStatus = (status) => {
+  const hasReblog = !!status.reblog;
+  const content = status.content || '';
+  const isPlaceholder = content.includes('此内容需要登录才能查看');
+  const isEmpty = content.trim() === '';
+  // 仅当没有转发内容且自身为空/占位时才隐藏
+  return !hasReblog && (isPlaceholder || isEmpty);
+};
+
+// Merge Misskey emoji maps from a note (including nested renote/reply)
+const mergeMisskeyEmojisFromNote = (note) => {
+  if (!note) return;
+
+  const mergeMap = (map) => {
+    if (!map || typeof map !== 'object') return;
+    Object.entries(map).forEach(([name, url]) => {
+      if (name && url) {
+        state.misskeyEmojis[name] = url;
+        // 如果带 host（例如 name@host），去掉 host 也存一份，便于匹配 :name:
+        if (name.includes('@')) {
+          const short = name.split('@')[0];
+          if (short) {
+            state.misskeyEmojis[short] = url;
+          }
+        }
+      }
+    });
+  };
+
+  mergeMap(note.emojis);
+  mergeMap(note.user?.emojis);
+  mergeMap(note.reactionEmojis);
+
+  if (note.reply) {
+    mergeMisskeyEmojisFromNote(note.reply);
+  }
+
+  if (note.renote) {
+    mergeMisskeyEmojisFromNote(note.renote);
+  }
+};
+
+// Convert Misskey Note to Mastodon-like Status format
+const convertMisskeyNoteToStatus = (note, domain) => {
+  // Handle renote (转发)
+  const isRenote = note.renoteId !== null && note.renoteId !== undefined;
+  const isReply = note.replyId !== null && note.replyId !== undefined;
+  
+  // 外层用户（转发者或回复者）
+  const outerUser = note.user || {};
+  const outerAcct = outerUser.host ? `${outerUser.username}@${outerUser.host}` : outerUser.username;
+  
+  // 确定显示的内容
+  // 优先级：renote > reply > 原帖
+  let displayNote = note;
+  if (isRenote && note.renote) {
+    // 如果是转发，显示被转发的内容
+    displayNote = note.renote;
+  } else if (isReply && note.reply && (!note.text || note.text === null)) {
+    // 如果是回复且原帖没有文本，显示被回复的内容
+    displayNote = note.reply;
+  }
+  
+  const displayUser = displayNote.user || {};
+  const displayAcct = displayUser.host ? `${displayUser.username}@${displayUser.host}` : displayUser.username;
+  
+  // Convert files to media_attachments
+  const media_attachments = (displayNote.files || []).map(file => ({
+    id: file.id,
+    type: file.type?.startsWith('image/') ? 'image' : file.type?.startsWith('video/') ? 'video' : 'unknown',
+    url: file.url,
+    preview_url: file.thumbnailUrl || file.url,
+    description: file.comment || '',
+    blurhash: file.blurhash || null,
+    meta: file.properties ? {
+      width: file.properties.width,
+      height: file.properties.height
+    } : null
+  }));
+  
+  // Build content with CW
+  // 如果原帖有文本，使用原帖文本；否则使用显示的内容
+  let content = note.text || displayNote.text || '';
+  
+  // 如果内容为空，检查是否有编辑历史
+  if (!content && displayNote.history && displayNote.history.length > 0) {
+    // 使用最新的编辑历史
+    const latestHistory = displayNote.history[displayNote.history.length - 1];
+    content = latestHistory.text || '';
+  }
+  
+  // 如果仍然为空且无转发/回复内容，直接丢弃
+  if (!content && !isRenote && !isReply) {
+    return null;
+  }
+  
+  if (displayNote.cw) {
+    content = `<details><summary>${displayNote.cw}</summary>${content}</details>`;
+  }
+  
+  // Build URL
+  const noteUrl = displayNote.url || `https://${domain}/notes/${displayNote.id}`;
+  
+  // Build outer status URL (转发帖子的链接)
+  const outerNoteUrl = note.url || `https://${domain}/notes/${note.id}`;
+  
+  // Convert to Mastodon-like format
+  const status = {
+    id: note.id,
+    created_at: note.createdAt, // 使用外层帖子的创建时间
+    in_reply_to_id: note.replyId,
+    in_reply_to_account_id: note.reply?.userId || null,
+    sensitive: displayNote.files?.some(f => f.isSensitive) || false,
+    spoiler_text: displayNote.cw || '',
+    visibility: note.visibility || 'public', // 使用外层帖子的可见性
+    language: null,
+    uri: note.uri || outerNoteUrl,
+    url: outerNoteUrl, // 外层帖子的链接
+    replies_count: note.repliesCount || 0,
+    reblogs_count: note.renoteCount || 0,
+    favourites_count: note.reactionCount || 0,
+    favourited: false,
+    reblogged: false,
+    muted: false,
+    bookmarked: false,
+    pinned: false,
+    content: content,
+    reblog: isRenote && note.renote ? convertMisskeyNoteToStatus(note.renote, domain) : null,
+    reply: note.reply ? convertMisskeyNoteToStatus(note.reply, domain) : null,
+    // 外层账户（转发者）
+    account: {
+      id: outerUser.id,
+      username: outerUser.username,
+      acct: outerAcct,
+      display_name: outerUser.name || outerUser.username,
+      locked: outerUser.requireSigninToViewContents || false,
+      bot: outerUser.isBot || false,
+      discoverable: outerUser.approved || false,
+      group: false,
+      created_at: null,
+      note: '',
+      url: outerUser.host ? `https://${outerUser.host}/@${outerUser.username}` : `https://${domain}/@${outerUser.username}`,
+      avatar: outerUser.avatarUrl || '',
+      avatar_static: outerUser.avatarUrl || '',
+      header: '',
+      header_static: '',
+      followers_count: 0,
+      following_count: 0,
+      statuses_count: 0,
+      last_status_at: null,
+      emojis: [],
+      fields: []
+    },
+    media_attachments: media_attachments,
+    mentions: [],
+    tags: (displayNote.tags || []).map(tag => ({ name: tag, url: `https://${domain}/tags/${tag}` })),
+    emojis: [],
+    card: null,
+    poll: null
+  };
+  
+  return status;
+};
+
 // Fetch custom emojis from instance
 const fetchCustomEmojis = async (domain) => {
   if (!domain) return;
@@ -120,20 +331,37 @@ const fetchCustomEmojis = async (domain) => {
   }
 };
 
+// Escape regex special chars for shortcode/emoji names
+const escapeEmojiNameForRegex = (name) => {
+  if (!name) return '';
+  return name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
 // Replace custom emoji shortcodes with images in content
 const replaceCustomEmojis = (content) => {
-  if (!state.customEmojis || state.customEmojis.length === 0) {
-    return content;
-  }
+  if (!content) return content;
   
   let processedContent = content;
   
-  // Replace each emoji shortcode (format: :shortcode:)
-  state.customEmojis.forEach(emoji => {
-    const regex = new RegExp(`:${emoji.shortcode}:`, 'g');
-    const emojiImg = `<img src="${emoji.static_url || emoji.url}" alt=":${emoji.shortcode}:" class="custom-emoji inline-block h-5 w-5 align-text-bottom" title=":${emoji.shortcode}:">`;
-    processedContent = processedContent.replace(regex, emojiImg);
-  });
+  // Mastodon emojis (array format)
+  if (state.customEmojis && state.customEmojis.length > 0) {
+    state.customEmojis.forEach(emoji => {
+      const escapedName = escapeEmojiNameForRegex(emoji.shortcode);
+      const regex = new RegExp(`:${escapedName}:`, 'g');
+      const emojiImg = `<img src="${emoji.static_url || emoji.url}" alt=":${emoji.shortcode}:" class="custom-emoji inline-block h-5 w-5 align-text-bottom" title=":${emoji.shortcode}:">`;
+      processedContent = processedContent.replace(regex, emojiImg);
+    });
+  }
+  
+  // Misskey emojis (object format: { "emoji_name": "url" })
+  if (state.misskeyEmojis && Object.keys(state.misskeyEmojis).length > 0) {
+    Object.entries(state.misskeyEmojis).forEach(([name, url]) => {
+      const escapedName = escapeEmojiNameForRegex(name);
+      const regex = new RegExp(`:${escapedName}:`, 'g');
+      const emojiImg = `<img src="${url}" alt=":${name}:" class="custom-emoji inline-block h-5 w-5 align-text-bottom" title=":${name}:">`;
+      processedContent = processedContent.replace(regex, emojiImg);
+    });
+  }
   
   return processedContent;
 };
@@ -170,6 +398,7 @@ const executeFetch = async (type) => {
   state.loading = true;
   state.fetchType = type;
   state.fetchCount = 0;
+  render(); // 立即刷新 UI，显示右下角小卡片
   
   // 重置控制标志
   stopRef = false;
@@ -187,31 +416,73 @@ const executeFetch = async (type) => {
   let domain = '';
   let accountId = '';
   let accountData = state.currentAccount;
+  // 固定平台：首次 initial 后锁定，后续复用
+  let activePlatform = state.platformLocked || 'auto';
 
   try {
     if (type === 'initial') {
-      const parsed = parseMastodonUrl(state.urlInput);
-      if (!parsed) {
-        throw new Error('无效的 Mastodon 用户链接。');
+      // 自动判定平台：先尝试 Mastodon，失败再尝试 Misskey
+      let mastoParsed = parseMastodonUrl(state.urlInput);
+      let mastoError = null;
+      if (mastoParsed) {
+        try {
+          domain = mastoParsed.domain;
+          const lookupUrl = `https://${mastoParsed.domain}/api/v1/accounts/lookup?acct=${mastoParsed.username}`;
+          const lookupRes = await fetch(lookupUrl);
+          if (!lookupRes.ok) throw new Error('无法找到该用户。');
+          accountData = await lookupRes.json();
+          if (!accountData) throw new Error('账户数据解析失败');
+          state.currentAccount = accountData;
+          loadHistory(accountData.id);
+          accountId = accountData.id;
+          await fetchCustomEmojis(domain);
+          activePlatform = 'mastodon';
+          state.platformLocked = 'mastodon';
+          render();
+        } catch (err) {
+          mastoError = err;
+          // 清空，以便尝试 misskey
+          accountData = null;
+        }
       }
-      domain = parsed.domain;
-      
-      // 1. 获取账户信息
-      const lookupUrl = `https://${parsed.domain}/api/v1/accounts/lookup?acct=${parsed.username}`;
-      const lookupRes = await fetch(lookupUrl);
-      if (!lookupRes.ok) throw new Error('无法找到该用户。');
-      
-      accountData = await lookupRes.json();
-      if (!accountData) throw new Error('账户数据解析失败');
 
-      state.currentAccount = accountData;
-      loadHistory(accountData.id);
-      accountId = accountData.id;
-      
-      // Fetch custom emojis for this instance
-      await fetchCustomEmojis(domain);
-      
-      render();
+      if (!accountData) {
+        // 尝试 Misskey
+        const parsed = parseMisskeyUrl(state.urlInput);
+        if (!parsed) {
+          throw new Error(mastoError ? mastoError.message : '无法解析该链接为 Mastodon 或 Misskey');
+        }
+        domain = parsed.domain;
+        const userId = await getUserId(domain, parsed.username);
+        accountId = userId;
+
+        // 先放置占位账号
+        accountData = {
+          id: userId,
+          username: parsed.username,
+          acct: parsed.username,
+          display_name: parsed.username,
+          url: `https://${domain}/@${parsed.username}`,
+          avatar: '',
+          note: '',
+          locked: false,
+          bot: false,
+          created_at: null
+        };
+        state.currentAccount = accountData;
+        loadHistory(userId);
+        render();
+
+        // 实例表情
+        try {
+          state.misskeyEmojis = await getInstanceEmojis(domain, { token: null });
+        } catch (e) {
+          console.warn('Failed to fetch Misskey instance emojis:', e);
+        }
+
+        activePlatform = 'misskey';
+        state.platformLocked = 'misskey';
+      }
     } else {
       // 如果是继续抓取或更新，必须已有账户信息
       if (!state.currentAccount) throw new Error('未找到账户信息');
@@ -219,9 +490,15 @@ const executeFetch = async (type) => {
         const u = new URL(state.currentAccount.url);
         domain = u.hostname;
       } catch {
-        const p = parseMastodonUrl(state.urlInput);
-        if (p) domain = p.domain;
-        else throw new Error('无法解析实例域名');
+        if (activePlatform === 'misskey') {
+          const p = parseMisskeyUrl(state.urlInput);
+          if (p) domain = p.domain;
+          else throw new Error('无法解析实例域名');
+        } else {
+          const p = parseMastodonUrl(state.urlInput);
+          if (p) domain = p.domain;
+          else throw new Error('无法解析实例域名');
+        }
       }
       accountId = state.currentAccount.id;
       accountData = state.currentAccount;
@@ -245,118 +522,271 @@ const executeFetch = async (type) => {
     let keepFetching = true;
     let sessionCollectedCount = 0; // 本次操作抓取的数量
 
-    while (keepFetching) {
-      // 检查停止信号
-      if (stopRef) {
-        break;
-      }
-
-      // 检查暂停信号
-      if (pausedRef) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        continue; // 跳过本次循环，重新检查
-      }
-
-      // 构造 API URL
-      // 基础参数
-      let statusesUrl = `https://${domain}/api/v1/accounts/${accountId}/statuses?limit=40`;
-      
-      // 应用抓取前的筛选配置 (只在 initial 模式或 older 模式下应用较好，newer 模式通常希望获取所有更新)
-      // 但为了统一，我们始终应用用户的配置
-      if (state.fetchConfig.excludeReplies) statusesUrl += `&exclude_replies=true`;
-      if (state.fetchConfig.excludeReblogs) statusesUrl += `&exclude_reblogs=true`;
-
-      // 分页参数
-      if (nextMaxId) statusesUrl += `&max_id=${nextMaxId}`;
-      if (sinceId) statusesUrl += `&since_id=${sinceId}`; // 注意: Mastodon API 对于 since_id 有时只返回新数据，不一定分页
-
-      // 发起请求
-      const res = await fetch(statusesUrl);
-      if (!res.ok) throw new Error('API 请求失败: ' + res.statusText);
-      
-      const batch = await res.json();
-
-      // 停止条件1: 空数组
-      if (batch.length === 0) {
-        keepFetching = false;
-        break;
-      }
-
-      // 处理数据
-      // 如果是 'newer' 模式，Mastodon 返回的是从 since_id 之后的所有数据（可能很多），或者按 limit 分页
-      // 如果是分页的，新数据是倒序的（最新的在最前）。
-      // 我们需要把 batch 加到 allStatuses 的前面 (如果是 newer) 或后面 (older/initial)
-
-      let filteredBatch = batch;
-
-      // 停止条件2: 按日期筛选 (抓取某年某月某日之后的帖子)
-      // 解析 created_at 判断
-      if (state.fetchConfig.mode === 'limit_date' && type !== 'newer') { // newer 模式不应受旧日期限制
-        const limitTime = new Date(state.fetchConfig.limitDate).getTime();
-        // 检查 batch 中最后一条是否已经早于 limitDate
-        const lastItemTime = new Date(batch[batch.length - 1].created_at).getTime();
+    if (activePlatform === 'misskey' && type === 'initial') {
+      // Misskey 一次性获取所有数据
+      try {
+        console.log('Fetching Misskey notes...');
+        const notes = await getAllNotesData(state.urlInput, {
+          limit: 100,
+          includeReplies: !state.fetchConfig.excludeReplies,
+          includeRenotes: !state.fetchConfig.excludeReblogs,
+          onProgress: (currentCount) => {
+            state.fetchCount = currentCount;
+            updateFetchCount();
+          },
+          shouldStop: () => stopRef,
+          shouldPause: () => pausedRef,
+        });
+        console.log('Got notes:', notes.length);
         
-        if (lastItemTime < limitTime) {
-          // 这一批里有部分数据过期了，截断
-          filteredBatch = batch.filter(s => new Date(s.created_at).getTime() >= limitTime);
-          keepFetching = false; // 到了截止日期，停止
+        if (notes.length === 0) {
+          throw new Error('无法找到该用户或该用户没有公开帖子。');
         }
-      }
-
-      // 更新状态 (UI显示)
-      if (filteredBatch.length > 0) {
-        if (type === 'newer') {
-          // 对于更新，我们要加到最前面
-          // 注意：如果 batch 有多页，这里逻辑稍微复杂。通常 since_id 抓取用于少量更新。
-          // 简单起见，我们假设 newer 抓取是一次性的或者 batch 是最新的。
-          // 实际上 API 可能会返回 [新3, 新2, 新1]。我们直接解构。
-          state.allStatuses = [...filteredBatch, ...state.allStatuses];
-        } else {
-          state.allStatuses = [...state.allStatuses, ...filteredBatch];
+        
+        // 从第一条帖子获取用户信息
+        const firstNote = notes[0];
+        const user = firstNote.user || {};
+        const acct = user.host ? `${user.username}@${user.host}` : user.username;
+        
+        // 转换为 Mastodon 格式的账户对象
+        accountData = {
+          id: accountId,
+          username: user.username,
+          acct: acct,
+          display_name: user.name || user.username,
+          url: user.host ? `https://${user.host}/@${user.username}` : `https://${domain}/@${user.username}`,
+          avatar: user.avatarUrl || '',
+          note: '',
+          locked: user.requireSigninToViewContents || false,
+          bot: user.isBot || false,
+          created_at: null
+        };
+        
+        state.currentAccount = accountData;
+        loadHistory(accountId);
+        
+        // 转换并过滤
+        let convertedStatuses = notes
+          .map(note => convertMisskeyNoteToStatus(note, domain))
+          .filter(Boolean)
+          .filter(s => !shouldHideStatus(s));
+        
+        // 应用日期筛选
+        if (state.fetchConfig.mode === 'limit_date') {
+          const limitTime = new Date(state.fetchConfig.limitDate).getTime();
+          convertedStatuses = convertedStatuses.filter(s => new Date(s.created_at).getTime() >= limitTime);
         }
-        sessionCollectedCount += filteredBatch.length;
+        
+        // 应用数量筛选
+        if (state.fetchConfig.mode === 'limit_count') {
+          convertedStatuses = convertedStatuses.slice(0, state.fetchConfig.limitCount);
+        }
+        
+        // 收集所有表情符号：优先服务器表情，再合并帖子/用户级表情
+        if (!state.misskeyEmojis) state.misskeyEmojis = {};
+        mergeMisskeyEmojisFromNote({ user }); // 当前用户
+        notes.forEach(mergeMisskeyEmojisFromNote);
+        
+        state.allStatuses = convertedStatuses;
+        sessionCollectedCount = convertedStatuses.length;
         state.fetchCount = sessionCollectedCount;
-        
-        // 更新UI（增量更新）
-        if (type === 'initial' || (type === 'older' && !state.currentAccount)) {
-          // 初始抓取时，需要完整渲染
-          render();
-        } else {
-          // 增量抓取时，只更新计数
-          updateFetchCount();
-        }
+        keepFetching = false;
+      } catch (err) {
+        throw new Error('Misskey API 请求失败: ' + err.message);
+      }
+    } else if (activePlatform === 'misskey' && (type === 'older' || type === 'newer')) {
+      // Misskey 增量抓取（循环，直到无更多或手动停止）
+      const includeReplies = !state.fetchConfig.excludeReplies;
+      const includeRenotes = !state.fetchConfig.excludeReblogs;
+      const baseLimit = 100;
+
+      // 分页锚点
+      let sinceId = null;
+      let untilId = null;
+      if (type === 'older' && state.allStatuses.length > 0) {
+        untilId = state.allStatuses[state.allStatuses.length - 1].id;
+      }
+      if (type === 'newer' && state.allStatuses.length > 0) {
+        sinceId = state.allStatuses[0].id;
       }
 
-      // 停止条件3: 按数量筛选 (抓取最新的 N 条)
-      if (state.fetchConfig.mode === 'limit_count' && type === 'initial') {
-        if (sessionCollectedCount >= state.fetchConfig.limitCount) {
-          // 如果超出了，可能需要截断 (这里简单处理，不截断多余的几条，直接停)
-          keepFetching = false;
-        }
-      }
+      try {
+        while (keepFetching) {
+          if (stopRef) break;
+          const batch = await fetchMisskeyBatch({
+            domain,
+            userId: accountId,
+            limit: baseLimit,
+            includeReplies,
+            includeRenotes,
+            sinceId,
+            untilId,
+            shouldStop: () => stopRef,
+            shouldPause: () => pausedRef,
+          });
 
-      // 准备下一页
-      if (keepFetching) {
-        if (type === 'newer') {
-          // 抓取更新时，通常 since_id 机制不同。
-          // 如果返回了满 limit 条，说明可能还有更新的。
-          // 这里的 min_id/since_id 分页逻辑比较复杂，简单实现：只抓一页更新，或者
-          // 更新 `sinceId` 为 batch[0].id (最新的ID) ? 不，since_id 是基准。
-          // 如果 batch.length < 40，说明没更多了。
-          if (batch.length < 40) keepFetching = false;
-          else {
-            // 如果还有更多更新的（较少见），Mastodon API 文档建议用 min_id 向上翻页
-            // 这里简化：抓取更新暂时只抓取第一页 (40条)
-            keepFetching = false; 
+          // 合并新增批次中的表情映射，包含嵌套的回复/转发
+          batch.forEach(mergeMisskeyEmojisFromNote);
+
+          if (batch.length === 0) {
+            keepFetching = false;
+            break;
           }
-        } else {
-          // Initial 或 Older，向下翻页
-          nextMaxId = batch[batch.length - 1].id;
-          // 避免 API 速率限制
-          await new Promise(r => setTimeout(r, 400));
+
+          // 过滤隐藏/空内容
+          let converted = batch
+            .map(note => convertMisskeyNoteToStatus(note, domain))
+            .filter(Boolean)
+            .filter(s => !shouldHideStatus(s));
+
+          // 日期筛选（仅在 limit_date 模式下）
+          if (state.fetchConfig.mode === 'limit_date') {
+            const limitTime = new Date(state.fetchConfig.limitDate).getTime();
+            converted = converted.filter(s => new Date(s.created_at).getTime() >= limitTime);
+          }
+
+          if (converted.length > 0) {
+            if (type === 'newer') {
+              state.allStatuses = [...converted, ...state.allStatuses];
+            } else {
+              state.allStatuses = [...state.allStatuses, ...converted];
+            }
+            sessionCollectedCount += converted.length;
+            state.fetchCount = sessionCollectedCount;
+            updateFetchCount();
+          }
+
+          // 更新分页锚点
+          if (type === 'older') {
+            untilId = batch[batch.length - 1].id;
+          } else {
+            // newer：Misskey sinceId 获取比 sinceId 更新的，若已满则尝试继续
+            sinceId = batch[0].id;
+          }
+
+          // 如果不足一页，说明没有更多
+          if (batch.length < baseLimit) {
+            keepFetching = false;
+          }
         }
+      } catch (err) {
+        throw new Error('Misskey API 请求失败: ' + err.message);
       }
-    } // end while
+    } else {
+      // Mastodon 平台或继续抓取
+      while (keepFetching) {
+        // 检查停止信号
+        if (stopRef) {
+          break;
+        }
+
+        // 检查暂停信号
+        if (pausedRef) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue; // 跳过本次循环，重新检查
+        }
+
+        // 构造 API URL
+        // 基础参数
+        let statusesUrl = `https://${domain}/api/v1/accounts/${accountId}/statuses?limit=40`;
+        
+        // 应用抓取前的筛选配置 (只在 initial 模式或 older 模式下应用较好，newer 模式通常希望获取所有更新)
+        // 但为了统一，我们始终应用用户的配置
+        if (state.fetchConfig.excludeReplies) statusesUrl += `&exclude_replies=true`;
+        if (state.fetchConfig.excludeReblogs) statusesUrl += `&exclude_reblogs=true`;
+
+        // 分页参数
+        if (nextMaxId) statusesUrl += `&max_id=${nextMaxId}`;
+        if (sinceId) statusesUrl += `&since_id=${sinceId}`; // 注意: Mastodon API 对于 since_id 有时只返回新数据，不一定分页
+
+        // 发起请求
+        const res = await fetch(statusesUrl);
+        if (!res.ok) throw new Error('API 请求失败: ' + res.statusText);
+        
+        const batch = await res.json();
+
+        // 停止条件1: 空数组
+        if (batch.length === 0) {
+          keepFetching = false;
+          break;
+        }
+
+        // 处理数据
+        // 如果是 'newer' 模式，Mastodon 返回的是从 since_id 之后的所有数据（可能很多），或者按 limit 分页
+        // 如果是分页的，新数据是倒序的（最新的在最前）。
+        // 我们需要把 batch 加到 allStatuses 的前面 (如果是 newer) 或后面 (older/initial)
+
+        let filteredBatch = batch.filter(s => !shouldHideStatus(s));
+
+        // 停止条件2: 按日期筛选 (抓取某年某月某日之后的帖子)
+        // 解析 created_at 判断
+        if (state.fetchConfig.mode === 'limit_date' && type !== 'newer') { // newer 模式不应受旧日期限制
+          const limitTime = new Date(state.fetchConfig.limitDate).getTime();
+          // 检查 batch 中最后一条是否已经早于 limitDate
+          const lastItemTime = new Date(batch[batch.length - 1].created_at).getTime();
+          
+          if (lastItemTime < limitTime) {
+            // 这一批里有部分数据过期了，截断
+            filteredBatch = batch.filter(s => new Date(s.created_at).getTime() >= limitTime);
+            keepFetching = false; // 到了截止日期，停止
+          }
+        }
+
+        // 更新状态 (UI显示)
+        if (filteredBatch.length > 0) {
+          if (type === 'newer') {
+            // 对于更新，我们要加到最前面
+            // 注意：如果 batch 有多页，这里逻辑稍微复杂。通常 since_id 抓取用于少量更新。
+            // 简单起见，我们假设 newer 抓取是一次性的或者 batch 是最新的。
+            // 实际上 API 可能会返回 [新3, 新2, 新1]。我们直接解构。
+            state.allStatuses = [...filteredBatch, ...state.allStatuses];
+          } else {
+            state.allStatuses = [...state.allStatuses, ...filteredBatch];
+          }
+          sessionCollectedCount += filteredBatch.length;
+          state.fetchCount = sessionCollectedCount;
+          
+          // 更新UI（增量更新）
+          if (type === 'initial' || (type === 'older' && !state.currentAccount)) {
+            // 初始抓取时，需要完整渲染
+            render();
+          } else {
+            // 增量抓取时，只更新计数
+            updateFetchCount();
+          }
+        }
+
+        // 停止条件3: 按数量筛选 (抓取最新的 N 条)
+        if (state.fetchConfig.mode === 'limit_count' && type === 'initial') {
+          if (sessionCollectedCount >= state.fetchConfig.limitCount) {
+            // 如果超出了，可能需要截断 (这里简单处理，不截断多余的几条，直接停)
+            keepFetching = false;
+          }
+        }
+
+        // 准备下一页
+        if (keepFetching) {
+          if (type === 'newer') {
+            // 抓取更新时，通常 since_id 机制不同。
+            // 如果返回了满 limit 条，说明可能还有更新的。
+            // 这里的 min_id/since_id 分页逻辑比较复杂，简单实现：只抓一页更新，或者
+            // 更新 `sinceId` 为 batch[0].id (最新的ID) ? 不，since_id 是基准。
+            // 如果 batch.length < 40，说明没更多了。
+            if (batch.length < 40) keepFetching = false;
+            else {
+              // 如果还有更多更新的（较少见），Mastodon API 文档建议用 min_id 向上翻页
+              // 这里简化：抓取更新暂时只抓取第一页 (40条)
+              keepFetching = false; 
+            }
+          } else {
+            // Initial 或 Older，向下翻页
+            nextMaxId = batch[batch.length - 1].id;
+            // 避免 API 速率限制
+            await new Promise(r => setTimeout(r, 400));
+          }
+        }
+      } // end while
+    }
 
     if (type === 'initial' && sessionCollectedCount === 0) {
       // 如果不是被停止的，才报错
@@ -365,10 +795,17 @@ const executeFetch = async (type) => {
       }
     }
 
-    // 缓存数据
-    if (accountData && type === 'initial') {
+    // 缓存数据（包含账号、状态、misskey 表情），增量抓取也会缓存
+    const cacheAccount = accountData || state.currentAccount;
+    if (cacheAccount && state.allStatuses.length > 0) {
       try {
-        localStorage.setItem(`cached_data_${accountData.id}`, JSON.stringify(state.allStatuses));
+        const cachedPayload = {
+          account: cacheAccount,
+          statuses: state.allStatuses,
+          misskeyEmojis: state.misskeyEmojis || {},
+          platform: state.platformLocked || state.platform,
+        };
+        localStorage.setItem(`cached_data_${cacheAccount.id}`, JSON.stringify(cachedPayload));
       } catch (e) {
         console.warn('Storage quota exceeded, could not cache full dataset.');
       }
@@ -388,7 +825,14 @@ const executeFetch = async (type) => {
 // Handle URL Fetch (兼容旧接口)
 const handleFetch = async (e) => {
   e.preventDefault();
-  await executeFetch('initial');
+  try {
+    await executeFetch('initial');
+  } catch (err) {
+    console.error('Fetch error:', err);
+    state.error = err.message || '发生未知错误';
+    state.loading = false;
+    render();
+  }
 };
 
 // Parse ActivityPub actor.json to Mastodon API account format
@@ -665,6 +1109,7 @@ const handleFileUpload = async (e) => {
   state.currentStatus = null;
   state.currentAccount = null;
   state.allStatuses = [];
+  state.misskeyEmojis = {};
   render();
 
   try {
@@ -783,10 +1228,13 @@ const handleFileUpload = async (e) => {
               statuses = jsonContent;
               account = statuses[0].account;
           } else if (jsonContent.type === 'mastodon-picker-backup' && Array.isArray(jsonContent.statuses)) {
-              // Backup with Progress Format
+              // Backup with Progress Format (兼容 Misskey，自定义表情可选)
               statuses = jsonContent.statuses;
               account = jsonContent.account;
               restoredIds = new Set(jsonContent.viewedIds);
+              if (jsonContent.misskeyEmojis && typeof jsonContent.misskeyEmojis === 'object') {
+                state.misskeyEmojis = jsonContent.misskeyEmojis;
+              }
           } else {
               throw new Error('无法识别的文件格式。');
           }
@@ -808,11 +1256,11 @@ const handleFileUpload = async (e) => {
               loadHistory(account.id);
           }
           
-          // Fetch custom emojis for this instance
-          const domain = extractDomainFromAccount(account);
-          if (domain) {
-            await fetchCustomEmojis(domain);
-          }
+           // Fetch custom emojis for Mastodon；Misskey 的表情已随备份恢复
+           const domain = extractDomainFromAccount(account);
+           if (domain && state.platform !== 'misskey') {
+             await fetchCustomEmojis(domain);
+           }
           
         } catch (err) {
           state.error = err.message || '解析文件失败';
@@ -945,23 +1393,38 @@ const autoLoadCachedData = async () => {
   const accountId = cacheKey.replace('cached_data_', '');
   
   try {
-    const cachedStatuses = JSON.parse(localStorage.getItem(cacheKey));
-    if (cachedStatuses && Array.isArray(cachedStatuses) && cachedStatuses.length > 0) {
-      // Get account from first status
-      const account = cachedStatuses[0].account;
-      if (account) {
-        state.currentAccount = account;
-        state.allStatuses = cachedStatuses;
-        loadHistory(account.id);
-        
-        // Fetch custom emojis for this instance
-        const domain = extractDomainFromAccount(account);
-        if (domain) {
-          await fetchCustomEmojis(domain);
-        }
-        
-        render();
+    const cached = JSON.parse(localStorage.getItem(cacheKey));
+    let account = null;
+    let statuses = [];
+    let misskeyEmojis = {};
+    let platform = null;
+
+    if (Array.isArray(cached)) {
+      // 旧格式：仅存储 statuses 数组
+      statuses = cached;
+      account = statuses[0]?.account || null;
+    } else if (cached && Array.isArray(cached.statuses)) {
+      // 新格式：包含 account、statuses、misskeyEmojis
+      statuses = cached.statuses;
+      account = cached.account || (statuses[0]?.account ?? null);
+      misskeyEmojis = cached.misskeyEmojis || {};
+      platform = cached.platform || null;
+    }
+
+    if (account && statuses.length > 0) {
+      state.currentAccount = account;
+      state.allStatuses = statuses;
+      state.misskeyEmojis = misskeyEmojis;
+      state.platformLocked = platform || (misskeyEmojis && Object.keys(misskeyEmojis).length > 0 ? 'misskey' : 'mastodon');
+      loadHistory(account.id);
+      
+      // Mastodon 自定义表情仍需拉取；Misskey 在缓存中恢复
+      const domain = extractDomainFromAccount(account);
+      if (domain && (!misskeyEmojis || Object.keys(misskeyEmojis).length === 0)) {
+        await fetchCustomEmojis(domain);
       }
+      
+      render();
     }
   } catch (e) {
     console.warn('Failed to load cached data:', e);
@@ -971,21 +1434,24 @@ const autoLoadCachedData = async () => {
 // Download Raw Data
 const handleDownloadRaw = () => {
   if (state.currentAccount && state.allStatuses.length > 0) {
-    downloadJson(state.allStatuses, `mastodon_data_${state.currentAccount.username}.json`);
+    const prefix = state.platform === 'misskey' ? 'misskey' : 'mastodon';
+    downloadJson(state.allStatuses, `${prefix}_data_${state.currentAccount.username}.json`);
   }
 };
 
 // Download Data with Progress
 const handleDownloadBackup = () => {
   if (state.currentAccount && state.allStatuses.length > 0) {
+    const prefix = state.platform === 'misskey' ? 'misskey' : 'mastodon';
     const backup = {
       type: 'mastodon-picker-backup',
       timestamp: new Date().toISOString(),
       account: state.currentAccount,
       statuses: state.allStatuses,
       viewedIds: Array.from(state.viewedIds),
+      misskeyEmojis: state.misskeyEmojis || {},
     };
-    downloadJson(backup, `mastodon_backup_${state.currentAccount.username}_${new Date().toISOString().slice(0, 10)}.json`);
+    downloadJson(backup, `${prefix}_backup_${state.currentAccount.username}_${new Date().toISOString().slice(0, 10)}.json`);
   }
 };
 
@@ -1002,11 +1468,19 @@ const renderStatusCard = (status) => {
   // 判断是否是回复
   const isReply = status.in_reply_to_id !== null && status.in_reply_to_id !== undefined;
   
-  // 如果是转发，使用reblog的内容；否则使用原status的内容
-  const displayStatus = isReblog ? status.reblog : status;
+  // 确定显示的内容
+  // 优先级：reblog > reply（如果原帖内容为空）> 原帖
+  let displayStatus = status;
+  if (isReblog && status.reblog) {
+    displayStatus = status.reblog;
+  } else if (isReply && status.reply && (!status.content || status.content.trim() === '' || status.content === '<em>此内容需要登录才能查看</em>')) {
+    // 如果是回复且原帖内容为空，显示被回复的内容
+    displayStatus = status.reply;
+  }
+  
   const { account: displayAccount, content: displayContent, created_at: displayCreatedAt, media_attachments: displayMedia, favourites_count: displayFavourites, reblogs_count: displayReblogs, replies_count: displayReplies, url: displayUrl } = displayStatus;
   
-  // 外层account（转发者）和url（转发帖子的链接）
+  // 外层account（转发者或回复者）和url（转发帖子的链接）
   const { account, url, created_at, favourites_count, reblogs_count, replies_count } = status;
   
   const cardHtml = `
@@ -1159,7 +1633,7 @@ const render = () => {
           毛象乱选
         </h1>
         <p class="text-slate-500 font-medium leading-relaxed">
-          Mastodon Random Picker
+          Mastodon & Misskey Random Picker
           <br />
           <span class="text-sm">
             Made by <a href="https://mo.b-hu.org" target="_blank" rel="noopener noreferrer" class="text-indigo-600 hover:underline">梦貘</a> with ❤️
@@ -1176,7 +1650,7 @@ const render = () => {
                 type="url"
                 id="url-input"
                 class="w-full py-4 pl-6 pr-14 outline-none text-slate-700 placeholder:text-slate-400"
-                placeholder="输入 Mastodon 主页链接 (如 https://alive.bar/@meomo)"
+                placeholder="输入主页链接 (支持 Mastodon / Misskey)"
                 value="${state.urlInput}"
                 required
                 ${state.loading ? 'disabled' : ''}
@@ -1275,18 +1749,30 @@ const render = () => {
               </div>
             </div>
           ` : `
-            <div class="relative flex items-center justify-center p-8 border-2 border-dashed border-slate-300 rounded-2xl bg-white hover:bg-slate-50 transition-colors cursor-pointer" id="file-drop-zone">
+            <div class="relative flex flex-col items-center justify-center p-8 border-2 border-dashed border-slate-300 rounded-2xl bg-white hover:bg-slate-50 transition-colors" id="file-drop-zone">
               <input 
                 type="file" 
-                id="file-input"
+                id="file-input-file"
+                class="hidden" 
+                multiple
+                accept=".json,application/json"
+              />
+              <input 
+                type="file" 
+                id="file-input-folder"
                 class="hidden" 
                 webkitdirectory
+                directory
                 multiple
               />
               <div class="flex flex-col items-center text-slate-500">
                 <div class="mb-2 text-indigo-500">${icons.Upload(32)}</div>
-                <p class="font-medium">点击选择文件夹或 JSON 文件</p>
-                <p class="text-xs text-slate-400 mt-1">支持：原始数据 JSON、含进度的备份文件，或 Mastodon 导出的存档文件夹（需先解压 ZIP）</p>
+                <p class="font-medium">导入本地数据</p>
+                <p class="text-xs text-slate-400 mt-1 text-center">支持：JSON 备份（含进度/Misskey/Mastodon）或 Mastodon 导出的存档文件夹（需先解压 ZIP）</p>
+                <div class="flex gap-2 mt-4">
+                  <button id="choose-file" class="px-3 py-1.5 rounded-md border border-slate-200 text-sm bg-slate-50 hover:bg-slate-100 text-slate-700">选择文件</button>
+                  <button id="choose-folder" class="px-3 py-1.5 rounded-md border border-slate-200 text-sm bg-slate-50 hover:bg-slate-100 text-slate-700">选择文件夹</button>
+                </div>
               </div>
             </div>
           `}
@@ -1366,7 +1852,7 @@ const render = () => {
       ` : ''}
 
       <!-- Loading State (When fetching data initially) -->
-      ${state.currentAccount && state.loading && state.fetchType === 'initial' && (!state.isPaused || state.allStatuses.length === 0) ? `
+      ${state.currentAccount && state.loading && state.fetchType === 'initial' ? `
         <div class="w-full max-w-2xl flex flex-col items-center gap-8 animate-fade-in-up">
           <div class="w-full min-h-[200px] flex justify-center items-start">
             <div class="text-center text-slate-400 mt-4 w-full">
@@ -1413,11 +1899,11 @@ const render = () => {
         </div>
       ` : ''}
 
-      <!-- 抓取中状态 (Loading Overlay for Older/Newer) -->
-      ${state.loading && state.currentAccount && state.fetchType !== 'initial' ? `
+      <!-- 抓取中状态 (Loading Overlay) -->
+      ${state.loading && state.currentAccount ? `
         <div class="fixed bottom-4 right-4 bg-white shadow-xl rounded-xl p-4 border border-indigo-100 z-50 animate-fade-in-up flex flex-col gap-2 w-64">
           <div class="flex items-center gap-2 text-indigo-600 font-medium text-sm">
-            ${icons.Loader2(16)} <span>正在抓取 ${state.fetchType === 'older' ? '更早' : '更新'} 数据...</span>
+            ${icons.Loader2(16)} <span>正在抓取${state.fetchType === 'older' ? '更早' : state.fetchType === 'newer' ? '更新' : ''}数据...</span>
           </div>
           <div class="text-xs text-slate-500 text-center">已获取 <span id="fetch-count-incremental">${state.fetchCount}</span> 条 ${state.isPaused ? '(已暂停)' : ''}</div>
           
@@ -1703,12 +2189,37 @@ const attachEventListeners = () => {
     });
   }
 
-  // File input
-  const fileInput = document.getElementById('file-input');
+  // File inputs (file / folder)
+  const fileInputFile = document.getElementById('file-input-file');
+  const fileInputFolder = document.getElementById('file-input-folder');
   const fileDropZone = document.getElementById('file-drop-zone');
-  if (fileInput && fileDropZone) {
-    fileDropZone.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', handleFileUpload);
+  const chooseFileBtn = document.getElementById('choose-file');
+  const chooseFolderBtn = document.getElementById('choose-folder');
+
+  if (fileDropZone && fileInputFile) {
+    fileDropZone.addEventListener('click', (e) => {
+      // 避免点击按钮时触发
+      if (e.target.closest('button')) return;
+      fileInputFile.click();
+    });
+  }
+  if (chooseFileBtn && fileInputFile) {
+    chooseFileBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      fileInputFile.click();
+    });
+  }
+  if (chooseFolderBtn && fileInputFolder) {
+    chooseFolderBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      fileInputFolder.click();
+    });
+  }
+  if (fileInputFile) {
+    fileInputFile.addEventListener('change', handleFileUpload);
+  }
+  if (fileInputFolder) {
+    fileInputFolder.addEventListener('change', handleFileUpload);
   }
 
   // Toggle mode
