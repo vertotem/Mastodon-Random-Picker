@@ -1895,7 +1895,7 @@ const attachEventListeners = () => {
     showReblogs.addEventListener('change', (e) => {
       state.displayFilter.showReblogs = e.target.checked;
     });
-  }}
+  }
 
   // 增量抓取按钮
   const fetchOlder = document.getElementById('fetch-older');
@@ -1922,4 +1922,3 @@ document.addEventListener('DOMContentLoaded', () => {
     render();
   }
 });
-
